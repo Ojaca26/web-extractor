@@ -1,87 +1,107 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+import json
+from urllib.parse import urljoin
+import hashlib
 
-# ---------------------------------------
-# 1. Extraer enlaces internos
-# ---------------------------------------
-def extract_all_internal_links(base_url):
-    seen = set()
+# Conjuntos globales para evitar duplicados
+visited_urls = set()
+content_hashes = set()
+
+# Extraer texto limpio, eliminando líneas repetidas
+def extraer_texto(url):
     try:
-        resp = requests.get(base_url, timeout=10)
-        soup = BeautifulSoup(resp.content, "html.parser")
-        base_domain = urlparse(base_url).netloc
-
-        for a in soup.find_all('a', href=True):
-            href = a['href'].strip().split('#')[0]
-            full_url = urljoin(base_url, href)
-            if base_domain in full_url and full_url not in seen:
-                seen.add(full_url)
+        res = requests.get(url, timeout=10)
+        soup = BeautifulSoup(res.text, "html.parser")
+        # Filtrar cadenas cortas
+        text = "\n".join([s.strip() for s in soup.stripped_strings if len(s.strip()) > 3])
+        # Eliminar líneas duplicadas, preservando orden
+        seen = set()
+        unique_lines = []
+        for line in text.split("\n"):
+            if line not in seen:
+                unique_lines.append(line)
+                seen.add(line)
+        clean_text = "\n".join(unique_lines)
+        return clean_text
     except Exception as e:
-        st.error(f"❌ Error extrayendo enlaces: {e}")
-    return sorted(seen)
+        return f"[ERROR] {e}"
 
-# ---------------------------------------
-# 2. Extraer texto estructurado
-# ---------------------------------------
-def extraer_texto_estructurado(url):
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.content, "html.parser")
+# Procesar página principal con detección de enlaces únicos
+def procesar_web(base_url):
+    r = requests.get(base_url)
+    soup = BeautifulSoup(r.text, "html.parser")
 
-        # Eliminar menú, script, estilo, footer, etc.
-        for tag in soup(["script", "style", "noscript", "iframe"]):
-            tag.decompose()
-        for tag in soup.select("header, footer, nav, .menu, .navbar, .main-nav, .footer"):
-            tag.decompose()
+    titulos = [h.get_text(strip=True) for h in soup.find_all(['h1', 'h2', 'h3'])]
 
-        contenido = ""
-        secciones = soup.find_all(['h1', 'h2', 'h3', 'h4', 'p', 'li'])
-        for tag in secciones:
-            nombre_tag = tag.name.lower()
-            texto = tag.get_text(strip=True)
-            if not texto:
-                continue
-            if nombre_tag == 'h1':
-                contenido += f"\n\n# {texto}\n"
-            elif nombre_tag == 'h2':
-                contenido += f"\n\n## {texto}\n"
-            elif nombre_tag == 'h3':
-                contenido += f"\n\n### {texto}\n"
-            elif nombre_tag == 'h4':
-                contenido += f"\n\n#### {texto}\n"
-            elif nombre_tag == 'li':
-                contenido += f"- {texto}\n"
-            else:
-                contenido += f"{texto}\n"
-        return contenido.strip()
-    except Exception as e:
-        return f"❌ Error procesando [{url}]: {e}"
+    estructura = {}
+    nav = soup.find('nav')
+    if nav:
+        for li in nav.find_all('li', recursive=True):
+            enlaces = li.find_all('a')
+            if enlaces:
+                padre = enlaces[0].get_text(strip=True)
+                hijos = [a.get_text(strip=True) for a in enlaces[1:] if a.get_text(strip=True) != padre]
+                estructura[padre] = {"submenus": hijos, "url": None}
 
-# ---------------------------------------
-# 3. Interfaz Streamlit
-# ---------------------------------------
-st.set_page_config(page_title="🌐 Web Scraper Estructurado", layout="centered")
-st.title("🧭 Extractor y Organizador Web")
+    links = []
+    for a in soup.find_all('a', href=True):
+        texto = a.get_text(strip=True)
+        href = urljoin(base_url, a['href'])
+        if texto and len(texto) > 3 and href not in visited_urls:
+            links.append({"texto": texto, "href": href})
+            visited_urls.add(href)
 
-url_input = st.text_input("🔗 Ingresa la URL del sitio", "https://www.sitesbarranquilla.com/es/")
+    index_links = {item['texto']: item['href'] for item in links}
 
-if st.button("🌟 Ejecutar todo"):
-    st.info("🔍 Extrayendo enlaces internos y procesando cada contenido…")
+    estructura_contenido = {}
+    for menu, data in estructura.items():
+        menu_url = index_links.get(menu)
+        contenido_menu = ""
+        if menu_url:
+            h = hashlib.md5(menu_url.encode()).hexdigest()
+            if h not in content_hashes:
+                contenido_menu = extraer_texto(menu_url)
+                content_hashes.add(h)
 
-    enlaces = extract_all_internal_links(url_input)
-    if not enlaces:
-        st.warning("⚠️ No se encontraron enlaces internos.")
+        estructura_contenido[menu] = {
+            "url": menu_url,
+            "contenido": contenido_menu,
+            "submenus": {}
+        }
+
+        for submenu in data["submenus"]:
+            submenu_url = index_links.get(submenu)
+            contenido_submenu = ""
+            if submenu_url:
+                h2 = hashlib.md5(submenu_url.encode()).hexdigest()
+                if h2 not in content_hashes:
+                    contenido_submenu = extraer_texto(submenu_url)
+                    content_hashes.add(h2)
+            estructura_contenido[menu]["submenus"][submenu] = {
+                "url": submenu_url,
+                "contenido": contenido_submenu
+            }
+
+    return {"titulos": titulos, "estructura": estructura_contenido}
+
+# Interfaz Streamlit (igual que antes)
+st.set_page_config(page_title="Scraper Jerárquico mejorado", layout="centered")
+st.title("🌐 Scraper con Deduplicación")
+st.markdown("Ahora evita URLs y líneas repetidas.")
+
+url_input = st.text_input("🔗 Ingresa la URL principal")
+if st.button("🚀 Procesar"):
+    if url_input:
+        with st.spinner("Analizando..."):
+            resultado = procesar_web(url_input)
+            st.success("✅ Listo.")
+            st.subheader("📋 Títulos")
+            st.write(resultado["titulos"])
+            st.subheader("📂 Estructura")
+            st.json(resultado["estructura"])
+            json_str = json.dumps(resultado, ensure_ascii=False, indent=2)
+            st.download_button("📥 Descargar JSON", json_str, "estructura_web.json", "application/json")
     else:
-        st.success(f"✅ {len(enlaces)} enlaces encontrados.")
-
-        for i, link in enumerate(enlaces, start=1):
-            st.markdown("---")
-            st.markdown(f"## {i}. 🔗 [{link}]({link})")
-            texto = extraer_texto_estructurado(link)
-            st.markdown(texto)
-
-        st.markdown("---")
-        st.success("👏 Proceso completado.")
+        st.warning("Por favor ingresa una URL válida.")
